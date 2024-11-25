@@ -1,3 +1,5 @@
 .ipynb_checkpoints/*
 rg_vectordb/*
 .env
+known_db/
+*.csv
