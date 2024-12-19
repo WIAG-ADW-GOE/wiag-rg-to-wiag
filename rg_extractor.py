@@ -42,11 +42,19 @@ class RegistParser:
         if skip_indices is None:
             skip_indices = {2522}
         self.skip_indices = skip_indices
+        name_regex = '[A-Z][a-z]+'
+        word_regex = '[A-Za-z]+'
+        word_dot_regex = f'{word_regex}\.?'
         self.pattern = (
-            r'^(?:\d+ [A-Z][a-z]+|'         # a digit followed by a correct grammatical word
-            r'\d+ \[[A-Za-z]+\.(?: [A-Za-z]+\.)*\] [A-Za-z]+|'
-            r'\d+ \([A-Za-z]+\) [A-Za-z]+)'
+            f'^(?:\d+ {name_regex}|' # a digit followed by a correct grammatical word
+            f'\d+ \[{word_dot_regex}(?: {word_dot_regex})*\] {word_regex}|' # a digit followed by an abbreviation
+            f'\d+ \({name_regex}\) {word_regex})' # a digit followed by a name in parenthesis and then a word
         )
+        # = (
+        #     r'^(?:\d+ [A-Z][a-z]+|'         # a digit followed by a correct grammatical word
+        #     r'\d+ \[[A-Za-z]+\.(?: [A-Za-z]+\.)*\] [A-Za-z]+|'
+        #     r'\d+ \([A-Za-z]+\) [A-Za-z]+)'
+        # )
 
     def _clean_segment(self, segment_lines):
         return ''.join(segment_lines).strip().replace('\x02', '').replace('\r\n', '\n')
@@ -55,6 +63,7 @@ class RegistParser:
         output = []
         current_segment = []
         previous_number = None
+        segment_text =''
 
         for data_i, text in enumerate(pages_data):
             lines = text.splitlines(keepends=True)
@@ -67,10 +76,10 @@ class RegistParser:
                             if current_number + 1 in self.skip_indices:
                                 current_number += 1
                             previous_number = current_number
-                            output.append(segment_text)
                         else:
-                            # Non-sequential number found; handle if needed
-                            pass
+                            current_segment.append(line)  # Append non-sequential line to current segment
+                            continue
+                    output.append(segment_text)
                     current_segment = [line]
                 else:
                     current_segment.append(line)
@@ -120,10 +129,20 @@ class HeaderSublemmaParser:
         month = '(?:' + '\.|'.join([
             "ian", "febr", "mart", "apr", "mai", "iun", "iul", "aug", "sept", "oct", "nov", "decb"
         ]) + '\.)'
-        date_pattern = f'(?:\d{{1,2}}(?:\.|\sgrossos)\s{month}\s\d{{2,4}}(?:\s\[\d\d\d\d\])?|\d\d/\d\d|\[sine\sdat.\]|\[dat.\sdeest\])'
-        optional_secondary_date_pattern = f'(?:\s\(exped\.\s{date_pattern}\))?'
-        optional_bracket = f'(?:\([A-Za-z]+\.(?:\s[A-Za-z]+\.?)*\)\s)?'
+
+        word_regex = '[A-Za-z]+'
+        word_dot_regex = f'{word_regex}\.?'
+        optional_bracket = f'(?:\({word_dot_regex}(?:\s{word_dot_regex})*\)\s)?'
+
         ending_sequence = f'{optional_bracket}(?:\w|(?:\w+\.?,?\s)+\w+\.?)\s\d+.*?(?:–|.\s?$)'
+        date_pattern = f'(?:\d{{1,2}}(?:\.|\sgrossos)\s{month}\s\d{{2,4}}(?:\s\[\d\d\d\d\])?|\d\d/\d\d|\[sine\sdat\.\]|\[dat\.\sdeest\])'
+        optional_secondary_date_pattern = f'(?:\s\(exped\.\s{date_pattern}\))?'
+
+        date_missing = "\[dat. deest\]|\[sine dat.\]"
+
+        dioc_string = '(?:dioc|commiss)\.\??'
+        dioc_pattern = f'(?:\[{dioc_string}\]|{dioc_string})\s(?:vac.\sp.\so.\s)?(\d\d/\d\d)\s({ending_sequence})'
+
         pattern = f'({date_pattern}){optional_secondary_date_pattern}\s({ending_sequence})'
 
         exceptions = []
@@ -147,12 +166,27 @@ class HeaderSublemmaParser:
                 splits.append({'text': text_after})
             return splits, matches_found
 
-        for i, sublemmas in enumerate(sublemmas_list):
+        for i, (header, sublemmas) in enumerate(zip(headers, sublemmas_list)):
+            if sublemmas == '' and i != 0:
+                # print("Empty found!")
+                # print("header", header)
+                # print("sublemmas", sublemmas)
+                # break
+                # print("No sublemma found")
+                final_list.append({"header": header, "sublemmas": [{'text': f"{i} ", 'date': ""}]})
+                # print(final_list[-1])
+                continue
             splits, matches_found = split_by_ending_sequence(sublemmas, pattern)
             if matches_found:
-                final_list.append({"header_idx": i, "sublemmas": splits})
+                # print(f"Splits found in {i}:")
+                # for split in splits:
+                #     print(split)
+                final_list.append({"header": header, "sublemmas": splits})
             elif i not in known_exceptions:
                 exceptions.append(i)
+            else:
+                print(f"No matches in {i}, but it's a known exception.")
+        
         return final_list, exceptions
 
 
@@ -161,18 +195,134 @@ class HeaderSublemmaParser:
 ########################################
 
 class DataExporter:
+    # Mapping of month abbreviations to their numerical representations
+    month_mapping = {
+        "ian.": "01", "febr.": "02", "mart.": "03", "apr.": "04", "mai.": "05",
+        "iun.": "06", "iul.": "07", "aug.": "08", "sept.": "09", "oct.": "10",
+        "nov.": "11", "decb.": "12"
+    }
+
+    # Regular expression pattern to match date formats
+    date_pattern = r'(?:\d{1,2}(?:\.|\sgrossos)\s(?:ian\.|febr\.|mart\.|apr\.|mai\.|iun\.|iul\.|aug\.|sept\.|oct\.|nov\.|decb\.)\s\d{2,4}(?:\s\[\d\d\d\d\])?|\d\d/\d\d|\[sine\sdat\.\]|\[dat\.\sdeest\])'
+
     @staticmethod
-    def export_to_csv(data, output_file):
-        # data is expected to be a list of dicts with 'header', 'sublemmas', etc.
-        # This is a placeholder implementation. Adjust fields as needed.
+    def clean_text(text):
+        """
+        Cleans the input text by removing newlines and trimming whitespace.
+
+        Args:
+            text (str): The text to clean.
+
+        Returns:
+            str: The cleaned text.
+        """
+        return text.replace("\n", " ").strip()
+
+    @staticmethod
+    def make_identifier(band, lemma_number, index):
+        """
+        Creates unique identifiers for entries and subentries.
+
+        Args:
+            band (str): The band identifier.
+            lemma_number (str): The lemma number as a zero-padded string.
+            index (int): The index of the subentry.
+
+        Returns:
+            tuple: A tuple containing 'id_RG_all' and 'id_RG'.
+        """
+        id_RG = f"1{band}{lemma_number}"
+        return f"{id_RG}-{index}", id_RG
+
+    @classmethod
+    def parse_date(cls, raw_date):
+        """
+        Parses the raw date string and formats it into 'YYYY-MM-DD' or similar formats.
+
+        Args:
+            raw_date (str): The raw date string to parse.
+
+        Returns:
+            str: The parsed and formatted date, or "Invalid Date" if parsing fails.
+        """
+        match = re.search(cls.date_pattern, raw_date)
+        if match:
+            raw_date = match.group()
+            parts = raw_date.split()
+            if len(parts) == 3:  # Format: DD. month YY
+                day = parts[0].replace(".", "")
+                month_abbr = parts[1]
+                month = cls.month_mapping.get(month_abbr, "00")
+                year = parts[2]
+                if len(year) == 2:
+                    year = f"14{year}"  # Assume century 1400
+                return f"{year}-{month}-{day.zfill(2)}"
+            elif "/" in raw_date:  # Handle MM/DD format
+                month, day = raw_date.split("/")
+                return f"14{month.zfill(2)}/14{day.zfill(2)}"  # Placeholder for unknown year
+        return "Invalid Date"  # Return a default value for invalid dates
+
+    @staticmethod
+    def export_to_csv(data, output_file, band="10"):
+        """
+        Exports the processed data to a CSV file with structured columns.
+
+        Args:
+            data (list): A list of dictionaries, each containing 'header' and 'sublemmas'.
+            output_file (str): The path to the output CSV file.
+            band (str, optional): The band identifier. Defaults to "10".
+        """
         with open(output_file, mode="w", newline="", encoding="utf-8") as file:
             writer = csv.writer(file, delimiter=';', quoting=csv.QUOTE_ALL)
-            # example header
-            writer.writerow(["id_RG_all", "id_RG", "volume", "nr_RG", "url_RG", 
-                             "header_no_tags", "date_sublemma", "date_sublemma_norm", 
-                             "nr_suffix", "sublemma_no_tags"])
-            # Implement actual logic as per your final_list structure
-            # ...
+            # Write the CSV header
+            writer.writerow([
+                "id_RG_all", "id_RG", "volume", "nr_RG", "url_RG", 
+                "header_no_tags", "raw_date", "parsed_date", 
+                "nr_suffix", "sublemma_no_tags"
+            ])
+            
+            for entry in data:
+                # Clean the header text
+                cleaned_header = DataExporter.clean_text(entry.get("header", ""))
+                index = 0  # Initialize index for sublemmas
+
+                # Extract and format the lemma number as a 5-digit string
+                lemma_number_match = re.match(r"\d+", cleaned_header)
+                lemma_int = int(lemma_number_match.group())
+                lemma_number = f"{lemma_int:05}"
+
+                # Create identifiers
+                id_RG_all, id_RG = DataExporter.make_identifier(band, lemma_number, index)
+
+                # Construct URL
+                url_RG = f"http://rg-online.dhi-roma.it/RG/{band}/{lemma_int}"
+
+                # Remove the lemma number from the header
+                cleaned_header_without_number = re.sub(r"^\d+\s*", "", cleaned_header)
+
+                # Write the header row with blank sublemma and date
+                writer.writerow([
+                    id_RG_all, id_RG, band, lemma_int, url_RG, 
+                    cleaned_header_without_number, "", "", index, ""
+                ])
+
+                # Process each sublemma
+                for sublemma in entry.get("sublemmas", []):
+                    index += 1  # Increment index for each sublemma
+                    cleaned_sublemma_text = DataExporter.clean_text(sublemma.get("text", ""))
+                    cleaned_date = DataExporter.clean_text(sublemma.get("date", ""))
+                    parsed_date = DataExporter.parse_date(cleaned_date)
+                    
+                    # Create identifiers for sublemmas
+                    id_RG_all_sub, id_RG_sub = DataExporter.make_identifier(band, lemma_number, index)
+                    
+                    # Write the sublemma row
+                    writer.writerow([
+                        id_RG_all_sub, id_RG_sub, band, lemma_int, url_RG, 
+                        "", cleaned_date, parsed_date, index, cleaned_sublemma_text
+                    ])
+        
+        print(f"CSV file '{output_file}' created successfully.")
 
 
 ########################################
@@ -271,6 +421,9 @@ if __name__ == "__main__":
     parser = RegistParser(skip_indices={2522})
     entries = parser.parse_entries(pages_data)
 
+    print("+"*100)
+    print(entries[3:9])
+
     # # Step 3: Split into headers and sublemmas
     header_parser = HeaderSublemmaParser()
     headers, sublemmas_list, split_exceptions = header_parser.split_header_sublemmas(entries)
@@ -278,13 +431,16 @@ if __name__ == "__main__":
     # Date extraction (if needed)
     final_list, exceptions = header_parser.extract_dates(sublemmas_list)
     
+    # print("+"*100)
+    # print(final_list[3:9])
+
     # Step 4: Save or process data (CSV)
     # Exporter (implement actual logic inside the exporter)
-    # DataExporter.export_to_csv(...)
+    DataExporter.export_to_csv(final_list, "band_10_export_same_test.csv")
 
     # Step 5: Setup VectorDB for unknown and known documents
-    db_manager = VectorDBManager(db_path="rg_vectordb")
-    unknown_collection = db_manager.create_collection("rg_x_collection")
+    # db_manager = VectorDBManager(db_path="rg_vectordb")
+    # unknown_collection = db_manager.create_collection("rg_x_collection")
 
     # Insert unknown docs (just as example)
     # unknown_collection.upsert(documents=[...], ids=[...])
